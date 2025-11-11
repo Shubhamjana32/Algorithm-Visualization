@@ -8,8 +8,8 @@ const HORIZONTAL_SPACING_UNIT = 30; // Base unit for horizontal separation
 const SVG_HEIGHT = 600;
 const INITIAL_SPEED = 500; // ms
 
-// --- API Endpoint ---
-const API_URL = 'http://127.0.0.1:5001/api/bst'; 
+// --- API Endpoint (Updated to live Render URL) ---
+const API_URL = 'https://algo-visualizer-api-ry07.onrender.com/api/bst'; 
 
 // --- Helper Component: Renders an individual node and its line to the parent ---
 const BSTNode = ({ node, x, y, parentX, parentY, highlight, action, path }) => {
@@ -24,7 +24,7 @@ const BSTNode = ({ node, x, y, parentX, parentY, highlight, action, path }) => {
         if (action === 'Inserted' || action === 'Root Inserted') {
             circleColor = 'fill-green-500';
             ringColor = 'ring-green-300';
-        } else if (action === 'Target Found') {
+        } else if (action === 'Target Found' || action === 'Value Deleted') { // Added 'Value Deleted' highlight
             circleColor = 'fill-indigo-500';
             ringColor = 'ring-indigo-300';
         } else if (action === 'Move Left' || action === 'Move Right' || action === 'Visiting') {
@@ -86,6 +86,7 @@ export default function App() {
     const [isPlaying, setIsPlaying] = useState(false);
     const [speed, setSpeed] = useState(INITIAL_SPEED); // ms per step
     const [message, setMessage] = useState('Enter a value to insert into the BST.');
+    const [isLoading, setIsLoading] = useState(false); // Loading state for API calls
 
     const timerRef = useRef(null);
 
@@ -101,8 +102,15 @@ export default function App() {
             // Stop when the last step is reached
             setIsPlaying(false);
             if (steps.length > 0) {
-                 const finalAction = steps[steps.length - 1].action;
-                 if (finalAction.includes('Inserted') || finalAction.includes('Found')) {
+                 const finalStep = steps[steps.length - 1];
+                 const finalAction = finalStep.action;
+                 
+                 // Update the tree state based on the final step's resulting tree
+                 if (finalStep.final_tree) {
+                    setTreeState(finalStep.final_tree);
+                 }
+
+                 if (finalAction.includes('Inserted') || finalAction.includes('Found') || finalAction.includes('Deleted')) {
                     setMessage(`Operation complete: ${finalAction}. Tree is stable.`);
                  } else {
                     setMessage('Operation completed.');
@@ -119,13 +127,13 @@ export default function App() {
                 clearInterval(timerRef.current);
             }
         };
-    }, [isPlaying, currentStepIndex, steps.length, speed]);
+    }, [isPlaying, currentStepIndex, steps.length, speed, steps]); // Added steps as dependency for final_tree logic
 
     const resetVisualization = () => {
         setIsPlaying(false);
         setCurrentStepIndex(-1);
         setSteps([]);
-        setMessage('Visualization ready. Insert or delete a value.');
+        setMessage('Visualization ready. Insert, search, or delete a value.');
     };
 
     const handleSpeedChange = (increment) => {
@@ -143,12 +151,15 @@ export default function App() {
         resetVisualization(); // Clear old steps before starting new operation
         const valueInt = parseInt(inputValue);
 
+        if (isLoading) return; // Prevent multiple API calls
+
         if (isNaN(valueInt) || valueInt < 1 || valueInt > 999) {
             setMessage('Please enter a valid number between 1 and 999.');
             return;
         }
 
         setMessage(`Performing ${operation} of value ${valueInt}...`);
+        setIsLoading(true);
 
         try {
             const response = await fetch(API_URL, {
@@ -164,30 +175,39 @@ export default function App() {
 
             if (!response.ok) {
                 const errorData = await response.json();
-                throw new Error(errorData.error || 'Network response was not ok');
+                throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
             }
 
             const result = await response.json();
             const newSteps = result.steps || [];
             
-            // CRITICAL: Receive new state with the snake_case key
+            // NOTE: We rely on the animation loop's final step to update the state (final_tree)
+            // but we use the immediate new_tree_state_dict if no steps were generated (e.g., failed insert/delete)
             const newState = result.new_tree_state_dict || null; 
             
             setSteps(newSteps);
-            setTreeState(newState);
-
+            
             if (newSteps.length > 0) {
                 setCurrentStepIndex(0); // Start visualization
                 setIsPlaying(true);
             } else {
-                setMessage('No steps generated for this operation (e.g., value already exists or tree is empty).');
+                // If no steps, immediately update tree (e.g., failed to insert duplicate, or root was deleted)
+                setTreeState(newState);
+                setMessage(result.message || 'No steps generated for this operation.');
             }
 
         } catch (error) {
             console.error('Error during BST operation:', error);
-            setMessage(`Error: ${error.message}`);
+            setMessage(`Error: ${error.message}. Check your backend server is running and accessible at ${API_URL}`);
+        } finally {
+            setIsLoading(false);
         }
     };
+    
+    // Add Search Operation
+    const handleSearch = () => {
+        handleOperation('search');
+    }
 
     // --- Tree Drawing Logic (Layout Calculation) ---
 
@@ -195,18 +215,24 @@ export default function App() {
         if (!root) return { nodes: [], svgWidth: 0 };
 
         let nodes = [];
-        let minX = 0;
+        // Start minX and maxX at the center to ensure even a single node provides a decent viewbox
+        let minX = 0; 
         let maxX = 0;
 
         // Recursive function to calculate node positions
         const calculatePosition = (node, depth, xOffset, parentX, parentY) => {
             if (!node) return 0; // Return width of null subtree
 
+            // The multiplier for horizontal spacing should be depth-dependent to prevent overlap
+            // We use a power of 2 approach for spacing unit growth
+            const spacing = HORIZONTAL_SPACING_UNIT * Math.pow(1.5, depth);
+
             // Calculate width of the left subtree
             const leftWidth = calculatePosition(node.left, depth + 1, xOffset, parentX, parentY);
             
             // Calculate current node's X position
-            const currentX = xOffset + leftWidth * HORIZONTAL_SPACING_UNIT;
+            // Center is based on left subtree's end point + current node's slot (1 unit)
+            const currentX = xOffset + leftWidth * spacing; 
             const currentY = depth * VERTICAL_SPACING + NODE_RADIUS * 2;
             
             // Track min/max X for SVG width calculation
@@ -224,24 +250,25 @@ export default function App() {
             });
 
             // Calculate width of the right subtree
-            // Start right subtree calculation immediately after current node's position + padding
-            const rightOffset = currentX / HORIZONTAL_SPACING_UNIT + 1;
-            const rightWidth = calculatePosition(node.right, depth + 1, rightOffset * HORIZONTAL_SPACING_UNIT, currentX, currentY);
+            // Right offset starts immediately after the current node's position + padding
+            const rightOffset = currentX / spacing + 1; // Used as the new starting position (relative index)
+            const rightWidth = calculatePosition(node.right, depth + 1, xOffset + (leftWidth + 1) * spacing, currentX, currentY);
 
             // Return the total width used by this subtree (left + self + right)
             return leftWidth + 1 + rightWidth;
         };
 
-        // Start calculation. Initial offset (xOffset) doesn't matter much since we center later.
-        calculatePosition(root, 0, 0, undefined, undefined);
+        // Start calculation. Use a large starting space (300) to ensure nodes aren't negative initially.
+        const totalWidthUnits = calculatePosition(root, 0, 300, undefined, undefined); 
 
         // Center the tree horizontally and translate coordinates to the final SVG positions
-        const totalWidth = maxX - minX;
+        const totalCalculatedWidth = maxX - minX;
         const centerOffset = 40; // Initial padding for the SVG viewbox
-        const viewBoxWidth = Math.max(800, totalWidth + 2 * centerOffset);
+        // Ensure minimum width of 800 and scale based on max calculated width
+        const viewBoxWidth = Math.max(800, totalCalculatedWidth + 2 * centerOffset);
         
-        // Translate all nodes to be centered in the viewbox
-        const shiftX = (viewBoxWidth / 2) - (totalWidth / 2);
+        // Translate all nodes to be centered in the viewbox (Shift everything to the right by centerOffset)
+        const shiftX = centerOffset;
 
         nodes = nodes.map(node => ({
             ...node,
@@ -268,7 +295,7 @@ export default function App() {
         <div className="min-h-screen bg-gray-50 flex flex-col font-sans p-4">
             <header className="text-center py-6 bg-white shadow-md rounded-lg mb-6">
                 <h1 className="text-4xl font-extrabold text-gray-800">Binary Search Tree Visualizer</h1>
-                <p className="text-gray-500 mt-2">See how BST operations work step-by-step.</p>
+                <p className="text-gray-500 mt-2">See how BST operations work step-by-step using a Python backend.</p>
             </header>
 
             {/* Controls */}
@@ -284,18 +311,29 @@ export default function App() {
                             className="w-24 p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 text-gray-700 shadow-sm"
                             placeholder="Value"
                             min="1" max="999"
+                            disabled={isPlaying || isLoading}
                         />
                         <button 
                             onClick={() => handleOperation('insert')} 
-                            className="flex items-center justify-center bg-green-600 hover:bg-green-700 text-white font-semibold py-3 px-4 rounded-lg shadow-md transition duration-300 transform hover:scale-105"
+                            className="flex items-center justify-center bg-green-600 hover:bg-green-700 text-white font-semibold py-3 px-4 rounded-lg shadow-md transition duration-300 transform hover:scale-105 disabled:opacity-50"
                             title="Insert Value"
+                            disabled={isPlaying || isLoading}
                         >
                             <Plus size={20} className="mr-1" /> Insert
                         </button>
                         <button 
+                            onClick={handleSearch} 
+                            className="flex items-center justify-center bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-4 rounded-lg shadow-md transition duration-300 transform hover:scale-105 disabled:opacity-50"
+                            title="Search Value"
+                            disabled={isPlaying || isLoading}
+                        >
+                            <Search size={20} className="mr-1" /> Search
+                        </button>
+                        <button 
                             onClick={() => handleOperation('delete')} 
-                            className="flex items-center justify-center bg-red-600 hover:bg-red-700 text-white font-semibold py-3 px-4 rounded-lg shadow-md transition duration-300 transform hover:scale-105"
+                            className="flex items-center justify-center bg-red-600 hover:bg-red-700 text-white font-semibold py-3 px-4 rounded-lg shadow-md transition duration-300 transform hover:scale-105 disabled:opacity-50"
                             title="Delete Value"
+                            disabled={isPlaying || isLoading}
                         >
                             <Trash2 size={20} className="mr-1" /> Delete
                         </button>
@@ -308,20 +346,22 @@ export default function App() {
                             onClick={() => handleSpeedChange(100)} 
                             className="p-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-full transition duration-150"
                             title="Slow Down"
+                            disabled={isPlaying || isLoading}
                         >
-                            <Minus size={16} />
+                            <Plus size={16} />
                         </button>
                         <button 
                             onClick={() => handleSpeedChange(-100)} 
                             className="p-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-full transition duration-150"
                             title="Speed Up"
+                            disabled={isPlaying || isLoading}
                         >
-                            <Plus size={16} />
+                            <Minus size={16} />
                         </button>
 
                         <button 
                             onClick={() => setIsPlaying(!isPlaying)}
-                            disabled={steps.length === 0}
+                            disabled={steps.length === 0 || isLoading}
                             className={`p-2 rounded-full shadow-lg transition duration-300 ${isPlaying ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-blue-500 hover:bg-blue-600'} text-white`}
                             title={isPlaying ? "Pause" : "Play"}
                         >
@@ -330,8 +370,9 @@ export default function App() {
                         
                         <button 
                             onClick={handleClearTree}
-                            className="p-2 bg-indigo-500 hover:bg-indigo-600 text-white rounded-full shadow-lg transition duration-300"
+                            className="p-2 bg-indigo-500 hover:bg-indigo-600 text-white rounded-full shadow-lg transition duration-300 disabled:opacity-50"
                             title="Clear Tree"
+                            disabled={isPlaying || isLoading}
                         >
                             <RotateCcw size={20} />
                         </button>
@@ -339,19 +380,31 @@ export default function App() {
                 </div>
             </div>
             
-            {/* Status Message */}
+            {/* Status Message / Loading Indicator */}
             <div className="mb-6 p-4 text-center bg-blue-100 border-l-4 border-blue-500 text-blue-800 rounded-lg shadow-inner">
-                <span className="font-semibold">Status: </span>
-                {message}
-                {currentStep && (
-                    <span className="ml-4 font-bold text-lg">
-                        Step {currentStepIndex + 1}/{steps.length}: {currentStep.action} {currentStep.value}
-                    </span>
+                {isLoading ? (
+                    <div className="flex items-center justify-center">
+                        <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-blue-800" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        <span className="font-semibold">Processing...</span>
+                    </div>
+                ) : (
+                    <>
+                        <span className="font-semibold">Status: </span>
+                        {message}
+                        {currentStep && (
+                            <span className="ml-4 font-bold text-lg">
+                                Step {currentStepIndex + 1}/{steps.length}: {currentStep.action}
+                            </span>
+                        )}
+                    </>
                 )}
             </div>
 
             {/* Visualization Canvas */}
-            <div className="flex-grow bg-white shadow-xl rounded-xl overflow-x-auto border border-gray-200">
+            <div className="flex-grow bg-white shadow-xl rounded-xl overflow-x-auto border border-gray-200 relative">
                 <svg 
                     viewBox={`0 0 ${svgWidth} ${SVG_HEIGHT}`} 
                     width="100%" 
@@ -364,9 +417,10 @@ export default function App() {
                             id="arrowhead" 
                             markerWidth="10" 
                             markerHeight="7" 
-                            refX="0" 
+                            refX="10" // Adjusted refX to be slightly past the circle center
                             refY="3.5" 
                             orient="auto"
+                            markerUnits="strokeWidth"
                         >
                             <polygon points="0 0, 10 3.5, 0 7" fill="#4B5563" />
                         </marker>
@@ -387,9 +441,9 @@ export default function App() {
                         />
                     ))}
                 </svg>
-                {treeState === null && (
+                {treeState === null && !isLoading && (
                     <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-center text-gray-400">
-                        <Search size={48} className="mx-auto" />
+                        <Plus size={48} className="mx-auto" />
                         <p className="mt-2 text-xl font-medium">Tree is empty. Insert a value to begin.</p>
                     </div>
                 )}
